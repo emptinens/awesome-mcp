@@ -43,10 +43,9 @@ let openPath = null;  // currently opened file
 let analyzed = -1;    // analysis level already run (-1 = never, 0-3 = level)
 let rzReady = null;
 
-function ensureRizin() {
-  if (rz) return;
-  const args = openPath ? ["-q", "-0", openPath] : ["-q", "-0"];
-  const child = spawn(RIZIN, args, { stdio: ["pipe", "pipe", "ignore"] });
+function spawnRizin(argv) {
+  if (rz) { try { rz.kill(); } catch {} rz = null; }
+  const child = spawn(RIZIN, argv, { stdio: ["pipe", "pipe", "ignore"] });
   rz = child;
   // Instance-guard: a killed OLD child's exit must not clobber the NEW one's state.
   const dead = () => { if (rz === child) { rz = null; openPath = null; analyzed = -1; } };
@@ -69,7 +68,7 @@ function ensureRizin() {
 // Trap 2: serialize every command through one queue.
 let cmdQueue = Promise.resolve();
 function r2cmd(cmd, { timeout = 30000 } = {}) {
-  ensureRizin();
+  if (!rz) spawnRizin(openPath ? ["-q", "-0", openPath] : ["-q", "-0"]);
   const run = cmdQueue.then(async () => {
     await rzReady;
     const child = rz;
@@ -107,9 +106,9 @@ async function r2json(cmd, opts) {
 // ---------------------------------------------------------------- helpers
 
 /** Strict numeric: hex or decimal. For base addresses and search values. */
-function checkNum(v, what = "address") {
+function checkNum(v) {
   const s = String(v).trim();
-  if (!/^(?:0x[0-9a-fA-F]+|\d+)$/.test(s)) throw new Error(`${what} must be numeric (0x… or decimal), got: ${v}`);
+  if (!/^(?:0x[0-9a-fA-F]+|\d+)$/.test(s)) throw new Error(`must be numeric (0x… or decimal), got: ${v}`);
   return s;
 }
 
@@ -160,36 +159,17 @@ async function jsonList(cmd, { regex, cursor, limit }, filterKey = "name") {
 async function openFile({ file_path, base_address, arch, bits, cpu, run_analyze = true, analysis_level }) {
   const p = String(file_path ?? "");
   if (!p.startsWith("/")) throw new Error("file_path must be an absolute path");
-  if (rz) { try { rz.kill(); } catch {} rz = null; }
   openPath = p;
   analyzed = -1;
-  ensureRizin();
+  // build argv once — base/arch/bits/cpu are rizin's own flags
+  const argv = ["-q", "-0"];
+  if (base_address) argv.push("-B", checkNum(base_address));
+  if (arch) argv.push("-a", String(arch));
+  if (bits) argv.push("-b", String(bits));
+  if (cpu) argv.push("-k", String(cpu));
+  argv.push(p);
+  spawnRizin(argv);
   await rzReady;
-  // rizin argv already handles base/arch/bits/cpu for raw binaries
-  if (base_address || arch || bits || cpu) {
-    const opts = [];
-    if (base_address) opts.push(`-B ${checkNum(base_address, "base_address")}`);
-    if (arch) opts.push(`-a ${arch}`);
-    if (bits) opts.push(`-b ${bits}`);
-    if (cpu) opts.push(`-k ${cpu}`);
-    // respawn with options (argv can't be set after spawn)
-    if (opts.length) {
-      if (rz) { try { rz.kill(); } catch {} rz = null; }
-      const child = spawn(RIZIN, ["-q", "-0", ...opts.flatMap((o) => o.split(" ")), openPath], { stdio: ["pipe", "pipe", "ignore"] });
-      rz = child;
-      const dead = () => { if (rz === child) { rz = null; openPath = null; analyzed = -1; } };
-      child.on("exit", dead);
-      child.on("error", dead);
-      rzReady = new Promise((resolve) => {
-        const absorb = (d) => {
-          if (d.toString("latin1").includes("\x00")) { child.stdout.off("data", absorb); resolve(); }
-        };
-        child.stdout.on("data", absorb);
-        setTimeout(resolve, 120000);
-      });
-      await rzReady;
-    }
-  }
   const info = await r2json("ij");
   let level = analysis_level;
   let downgraded = false;
@@ -303,10 +283,15 @@ const basicBlocks = async (a) => {
   return Array.isArray(d) ? { blocks: d.length, items: d.slice(0, 500) } : d;
 };
 
+async function graphOr(cmd, what, { cursor, limit } = {}) {
+  const data = await r2json(cmd, { timeout: 120000 });
+  if (typeof data === "string") return { error: `no ${what} — analyze first`, raw: truncateText(data, 2000) };
+  return data.nodes || [];
+}
+
 async function functionGraph(a) {
-  const data = await atAddr(a.address, "agf json");
-  if (typeof data === "string") return { error: "no graph — analyze first", raw: truncateText(data, 2000) };
-  const nodes = data.nodes || [];
+  const nodes = await graphOr(`s ${addrOrName(a.address)}; agf json`, "graph");
+  if (!Array.isArray(nodes)) return nodes;
   let edges = 0;
   for (const n of nodes) edges += (n.out_nodes || []).length;
   return { blocks: nodes.length, edges, nodes };
@@ -314,9 +299,9 @@ async function functionGraph(a) {
 
 async function callGraph(a) {
   requireFile();
-  const data = await r2json("agC json", { timeout: 120000 });
-  if (typeof data === "string") return { error: "no callgraph — analyze first", raw: truncateText(data, 2000) };
-  return pageSlice((data.nodes || []).map((n) => ({ id: n.id, name: n.title, offset: n.offset, calls: (n.out_nodes || []).length })), { cursor: a.cursor, limit: a.limit });
+  const nodes = await graphOr("agC json", "callgraph", a);
+  if (!Array.isArray(nodes)) return nodes;
+  return pageSlice(nodes.map((n) => ({ id: n.id, name: n.title, offset: n.offset, calls: (n.out_nodes || []).length })), { cursor: a.cursor, limit: a.limit });
 }
 
 async function disassembleFunction({ address, cursor, limit }) {
@@ -403,7 +388,7 @@ async function searchPatterns({ query, type = "string", cursor, limit }) {
     case "hex": cmd = `/xj ${q}`; break;
     case "wide": cmd = `/zj ${q} l utf16le`; break;
     case "value1": case "value2": case "value4": case "value8":
-      cmd = `/v${type.slice(5)}j ${checkNum(q, "value")}`; break;
+      cmd = `/v${type.slice(5)}j ${checkNum(q)}`; break;
     case "asm": cmd = `/aj ${q}`; break;
     default: cmd = `/zj ${q}`;
   }
@@ -422,12 +407,12 @@ async function lookupSymbol({ name, cursor, limit }) {
   return pageSlice(items, { cursor, limit });
 }
 
-async function lookupExport({ name }) {
+async function lookupExport({ name, cursor, limit }) {
   requireFile();
   const data = await r2json("iEj");
   const items = Array.isArray(data) ? data : [];
   const re = new RegExp(String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-  return pageSlice(items.filter((e) => re.test(e.name ?? "")), {});
+  return pageSlice(items.filter((e) => re.test(e.name ?? "")), { cursor, limit });
 }
 
 async function decompileFunction({ address, mode = "pdsf" }) {
@@ -532,108 +517,60 @@ const ADDR = { type: "string", description: "Address (0x…, decimal) or functio
 const addrSchema = (extra = {}, req = []) => ({ type: "object", properties: { address: ADDR, ...extra }, required: ["address", ...req] });
 
 const TOOLS = [
-  { name: "open_file", description: "Open a binary in rizin. Call this first. base_address/arch/bits/cpu for raw (headerless) binaries. Runs analysis by default (run_analyze=false to skip).", inputSchema: { type: "object", properties: { file_path: { type: "string", description: "Absolute path to the binary" }, base_address: { type: "string", description: "Base address for PIE/raw binaries, e.g. 0x400000" }, arch: { type: "string", description: "Arch override: arm, x86, mips…" }, bits: { type: "integer", description: "Bits override: 16/32/64" }, cpu: { type: "string", description: "CPU variant: cortex, generic…" }, run_analyze: { type: "boolean", default: true }, analysis_level: { type: "integer", minimum: 0, maximum: 3, default: 2 } }, required: ["file_path"] } },
-  { name: "close_file", description: "Close the open file and reset all state.", inputSchema: { type: "object", properties: {} } },
-  { name: "analyze", description: "Run rizin analysis. Levels: 0=aa (symbols+entry), 2=aaa (calls+refs+emulation, default), 3=aaaa (experimental, slow). Skips if already analyzed at that level.", inputSchema: { type: "object", properties: { level: { type: "integer", minimum: 0, maximum: 3, default: 2 } } } },
-  { name: "show_info", description: "Binary metadata (ij): format, arch, bits, endian, relro, canary, PIE, compiler, checksums.", inputSchema: { type: "object", properties: {} } },
-  { name: "analysis_info", description: "Analysis summary (aai): function count, xrefs, calls, strings, code coverage %.", inputSchema: { type: "object", properties: {} } },
-  { name: "list_functions", description: "Functions found by analysis (afl). regex filter, pagination, only_named to skip auto-numbered stubs.", inputSchema: listSchema({ only_named: { type: "boolean", description: "Skip functions like fcn.000030c0" } }) },
-  { name: "list_imports", description: "Imported symbols (ii) — what the binary pulls from libraries.", inputSchema: listSchema() },
-  { name: "list_exports", description: "Exported symbols (iE) — the binary's public interface.", inputSchema: listSchema() },
-  { name: "list_symbols", description: "All symbols with addresses (is).", inputSchema: listSchema() },
-  { name: "list_sections", description: "Sections and segments with permissions (iS).", inputSchema: { type: "object", properties: {} } },
-  { name: "list_libraries", description: "Linked shared libraries (il).", inputSchema: { type: "object", properties: {} } },
-  { name: "list_entrypoints", description: "Entrypoints with names (ie: program/init/fini).", inputSchema: { type: "object", properties: {} } },
-  { name: "list_strings", description: "Strings (iz data sections; all=true scans the whole file via izz). regex + min_length filters.", inputSchema: listSchema({ min_length: { type: "integer", default: 4 }, all: { type: "boolean", description: "Scan the whole file (slower)" } }) },
-  { name: "list_flags", description: "All flags/labels (fl) — rizin's namespace for named addresses.", inputSchema: listSchema() },
-  { name: "list_relocations", description: "Relocation table (ir).", inputSchema: listSchema() },
-  { name: "list_comments", description: "All comments (CCl).", inputSchema: listSchema() },
-  { name: "list_classes", description: "Classes for OO binaries (ic): C++, ObjC, Java/Dalvik.", inputSchema: { type: "object", properties: {} } },
-  { name: "list_methods", description: "Methods of a class (icm).", inputSchema: { type: "object", properties: { class_name: { type: "string" } }, required: ["class_name"] } },
-  { name: "show_function_details", description: "Function info (afi): size, basic blocks, stack frame, signature, vars.", inputSchema: addrSchema() },
-  { name: "list_function_vars", description: "Arguments and locals (afvl): names, types, stack/reg offsets.", inputSchema: addrSchema() },
-  { name: "list_function_calls", description: "Calls made by a function (afij callrefs) + data refs.", inputSchema: addrSchema() },
-  { name: "function_graph", description: "Control-flow graph of a function (agf): basic blocks with disasm bodies, jump edges. The closest thing to decompilation in rizin core.", inputSchema: addrSchema() },
-  { name: "call_graph", description: "Global callgraph (agC): every function, offset, out-call count. Paginated.", inputSchema: listSchema() },
-  { name: "basic_blocks", description: "Basic blocks of a function (afb): addr, size, instruction count.", inputSchema: addrSchema() },
-  { name: "disassemble_function", description: "Full assembly of a function (pdf). Paginated by line.", inputSchema: addrSchema() },
-  { name: "disassemble_at", description: "Disassemble N instructions at an address (pd).", inputSchema: addrSchema({ count: { type: "integer", default: 20, maximum: 500 } }) },
-  { name: "hexdump", description: "Hexdump with ASCII column (px).", inputSchema: addrSchema({ count: { type: "integer", default: 64, maximum: 4096 } }) },
-  { name: "read_hex", description: "Raw hex pairs (p8) — no ASCII column.", inputSchema: addrSchema({ count: { type: "integer", default: 32, maximum: 4096 } }) },
-  { name: "read_memory", description: "Bytes at address as a JSON array (pxj).", inputSchema: addrSchema({ count: { type: "integer", default: 64, maximum: 8192 } }) },
-  { name: "print_string_at", description: "NUL-terminated string at an address (ps).", inputSchema: addrSchema() },
-  { name: "xrefs_to", description: "References TO an address/symbol (axt) — who calls/reads it, enriched with the containing function name.", inputSchema: addrSchema() },
-  { name: "xrefs_from", description: "References FROM an address (axf + afij): what it calls and reads.", inputSchema: addrSchema() },
-  { name: "search", description: "Search the binary: string, hex pairs, wide (utf16le) string, value1/2/4/8 (numeric with width), or asm text. Returns hit addresses.", inputSchema: { type: "object", properties: { query: { type: "string", description: "String text / hex pairs (e.g. 454c46) / numeric value" }, type: { type: "string", enum: ["string", "hex", "wide", "value1", "value2", "value4", "value8", "asm"], default: "string" }, ...LIST_PROPS }, required: ["query"] } },
-  { name: "lookup_address", description: "What is at an address: flag name + delta (fd).", inputSchema: addrSchema() },
-  { name: "lookup_symbol", description: "Find symbols by name substring (is).", inputSchema: { type: "object", properties: { name: { type: "string" }, ...LIST_PROPS }, required: ["name"] } },
-  { name: "lookup_export", description: "Find exports by name substring (iE).", inputSchema: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } },
-  { name: "decompile_function", description: "Pseudo-code: pdsf (structured summary — strings, calls, refs; default), pds (block summary), pdr (recursive disassembly). Full C requires the rz-ghidra plugin.", inputSchema: addrSchema({ mode: { type: "string", enum: ["pdsf", "pds", "pdr"], default: "pdsf" } }) },
-  { name: "rename_function", description: "Rename a function (afn).", inputSchema: addrSchema({ new_name: { type: "string" } }, ["new_name"]) },
-  { name: "rename_flag", description: "Rename the flag at an address (fr).", inputSchema: addrSchema({ new_name: { type: "string" } }, ["new_name"]) },
-  { name: "rename_function_var", description: "Rename an arg/local variable (afvn).", inputSchema: { type: "object", properties: { address: ADDR, old_name: { type: "string", description: "e.g. var_90h" }, new_name: { type: "string" } }, required: ["address", "old_name", "new_name"] } },
-  { name: "set_var_type", description: "Change a variable's C type (afvt): int*, char[64]…", inputSchema: { type: "object", properties: { address: ADDR, var_name: { type: "string" }, type: { type: "string" } }, required: ["address", "var_name", "type"] } },
-  { name: "set_comment", description: "Comment at an address — appears in disassembly (CCu).", inputSchema: addrSchema({ comment: { type: "string" } }, ["comment"]) },
-  { name: "get_function_signature", description: "Current signature of a function (afs).", inputSchema: addrSchema() },
-  { name: "set_function_signature", description: "Set a function's signature (afs), e.g. \"int main(int argc, char **argv)\".", inputSchema: addrSchema({ signature: { type: "string" } }, ["signature"]) },
-  { name: "seek_to", description: "Move the rizin cursor (s) — subsequent pd/px default to it.", inputSchema: addrSchema() },
-  { name: "get_current_address", description: "Current cursor + containing function.", inputSchema: { type: "object", properties: {} } },
-  { name: "run_command", description: "Raw rizin command (escape hatch). Shell (!) and write (w*) commands blocked unless RIZIN_MCP_ALLOW_DANGEROUS=1.", inputSchema: { type: "object", properties: { command: { type: "string", description: "e.g. 'afl~main', 'pdf @ sym.main', 'izz~password'" }, ...LIST_PROPS }, required: ["command"] } },
+  { name: "open_file", description: "Open a binary in rizin. Call this first. base_address/arch/bits/cpu for raw (headerless) binaries. Runs analysis by default (run_analyze=false to skip).", run: openFile, inputSchema: { type: "object", properties: { file_path: { type: "string", description: "Absolute path to the binary" }, base_address: { type: "string", description: "Base address for PIE/raw binaries, e.g. 0x400000" }, arch: { type: "string", description: "Arch override: arm, x86, mips…" }, bits: { type: "integer", description: "Bits override: 16/32/64" }, cpu: { type: "string", description: "CPU variant: cortex, generic…" }, run_analyze: { type: "boolean", default: true }, analysis_level: { type: "integer", minimum: 0, maximum: 3, default: 2 } }, required: ["file_path"] } },
+  { name: "close_file", description: "Close the open file and reset all state.", run: closeFile, inputSchema: { type: "object", properties: {} } },
+  { name: "analyze", description: "Run rizin analysis. Levels: 0=aa (symbols+entry), 2=aaa (calls+refs+emulation, default), 3=aaaa (experimental, slow). Skips if already analyzed at that level.", run: analyze, inputSchema: { type: "object", properties: { level: { type: "integer", minimum: 0, maximum: 3, default: 2 } } } },
+  { name: "show_info", description: "Binary metadata (ij): format, arch, bits, endian, relro, canary, PIE, compiler, checksums.", run: showInfo, inputSchema: { type: "object", properties: {} } },
+  { name: "analysis_info", description: "Analysis summary (aai): function count, xrefs, calls, strings, code coverage %.", run: analysisInfo, inputSchema: { type: "object", properties: {} } },
+  { name: "list_functions", description: "Functions found by analysis (afl). regex filter, pagination, only_named to skip auto-numbered stubs.", run: listFunctions, inputSchema: listSchema({ only_named: { type: "boolean", description: "Skip functions like fcn.000030c0" } }) },
+  { name: "list_imports", description: "Imported symbols (ii) — what the binary pulls from libraries.", run: listImports, inputSchema: listSchema() },
+  { name: "list_exports", description: "Exported symbols (iE) — the binary's public interface.", run: listExports, inputSchema: listSchema() },
+  { name: "list_symbols", description: "All symbols with addresses (is).", run: listSymbols, inputSchema: listSchema() },
+  { name: "list_sections", description: "Sections and segments with permissions (iS).", run: listSections, inputSchema: { type: "object", properties: {} } },
+  { name: "list_libraries", description: "Linked shared libraries (il).", run: listLibraries, inputSchema: { type: "object", properties: {} } },
+  { name: "list_entrypoints", description: "Entrypoints with names (ie: program/init/fini).", run: listEntrypoints, inputSchema: { type: "object", properties: {} } },
+  { name: "list_strings", description: "Strings (iz data sections; all=true scans the whole file via izz). regex + min_length filters.", run: listStrings, inputSchema: listSchema({ min_length: { type: "integer", default: 4 }, all: { type: "boolean", description: "Scan the whole file (slower)" } }) },
+  { name: "list_flags", description: "All flags/labels (fl) — rizin's namespace for named addresses.", run: listFlags, inputSchema: listSchema() },
+  { name: "list_relocations", description: "Relocation table (ir).", run: listRelocations, inputSchema: listSchema() },
+  { name: "list_comments", description: "All comments (CCl).", run: listComments, inputSchema: listSchema() },
+  { name: "list_classes", description: "Classes for OO binaries (ic): C++, ObjC, Java/Dalvik.", run: listClasses, inputSchema: { type: "object", properties: {} } },
+  { name: "list_methods", description: "Methods of a class (icm).", run: listMethods, inputSchema: { type: "object", properties: { class_name: { type: "string" } }, required: ["class_name"] } },
+  { name: "show_function_details", description: "Function info (afi): size, basic blocks, stack frame, signature, vars.", run: showFunctionDetails, inputSchema: addrSchema() },
+  { name: "list_function_vars", description: "Arguments and locals (afvl): names, types, stack/reg offsets.", run: listFunctionVars, inputSchema: addrSchema() },
+  { name: "list_function_calls", description: "Calls made by a function (afij callrefs) + data refs.", run: listFunctionCalls, inputSchema: addrSchema() },
+  { name: "function_graph", description: "Control-flow graph of a function (agf): basic blocks with disasm bodies, jump edges. The closest thing to decompilation in rizin core.", run: functionGraph, inputSchema: addrSchema() },
+  { name: "call_graph", description: "Global callgraph (agC): every function, offset, out-call count. Paginated.", run: callGraph, inputSchema: listSchema() },
+  { name: "basic_blocks", description: "Basic blocks of a function (afb): addr, size, instruction count.", run: basicBlocks, inputSchema: addrSchema() },
+  { name: "disassemble_function", description: "Full assembly of a function (pdf). Paginated by line.", run: disassembleFunction, inputSchema: addrSchema() },
+  { name: "disassemble_at", description: "Disassemble N instructions at an address (pd).", run: disassembleAt, inputSchema: addrSchema({ count: { type: "integer", default: 20, maximum: 500 } }) },
+  { name: "hexdump", description: "Hexdump with ASCII column (px).", run: hexdump, inputSchema: addrSchema({ count: { type: "integer", default: 64, maximum: 4096 } }) },
+  { name: "read_hex", description: "Raw hex pairs (p8) — no ASCII column.", run: readHex, inputSchema: addrSchema({ count: { type: "integer", default: 32, maximum: 4096 } }) },
+  { name: "read_memory", description: "Bytes at address as a JSON array (pxj).", run: readMemory, inputSchema: addrSchema({ count: { type: "integer", default: 64, maximum: 8192 } }) },
+  { name: "print_string_at", description: "NUL-terminated string at an address (ps).", run: printStringAt, inputSchema: addrSchema() },
+  { name: "xrefs_to", description: "References TO an address/symbol (axt) — who calls/reads it, enriched with the containing function name.", run: xrefsTo, inputSchema: addrSchema() },
+  { name: "xrefs_from", description: "References FROM an address (axf + afij): what it calls and reads.", run: xrefsFrom, inputSchema: addrSchema() },
+  { name: "search", description: "Search the binary: string, hex pairs, wide (utf16le) string, value1/2/4/8 (numeric with width), or asm text. Returns hit addresses.", run: searchPatterns, inputSchema: { type: "object", properties: { query: { type: "string", description: "String text / hex pairs (e.g. 454c46) / numeric value" }, type: { type: "string", enum: ["string", "hex", "wide", "value1", "value2", "value4", "value8", "asm"], default: "string" }, ...LIST_PROPS }, required: ["query"] } },
+  { name: "lookup_address", description: "What is at an address: flag name + delta (fd).", run: lookupAddress, inputSchema: addrSchema() },
+  { name: "lookup_symbol", description: "Find symbols by name substring (is).", run: lookupSymbol, inputSchema: { type: "object", properties: { name: { type: "string" }, ...LIST_PROPS }, required: ["name"] } },
+  { name: "lookup_export", description: "Find exports by name substring (iE).", run: lookupExport, inputSchema: { type: "object", properties: { name: { type: "string" }, ...LIST_PROPS }, required: ["name"] } },
+  { name: "decompile_function", description: "Pseudo-code: pdsf (structured summary — strings, calls, refs; default), pds (block summary), pdr (recursive disassembly). Full C requires the rz-ghidra plugin.", run: decompileFunction, inputSchema: addrSchema({ mode: { type: "string", enum: ["pdsf", "pds", "pdr"], default: "pdsf" } }) },
+  { name: "rename_function", description: "Rename a function (afn).", run: renameFunction, inputSchema: addrSchema({ new_name: { type: "string" } }, ["new_name"]) },
+  { name: "rename_flag", description: "Rename the flag at an address (fr).", run: renameFlag, inputSchema: addrSchema({ new_name: { type: "string" } }, ["new_name"]) },
+  { name: "rename_function_var", description: "Rename an arg/local variable (afvn).", run: renameFunctionVar, inputSchema: { type: "object", properties: { address: ADDR, old_name: { type: "string", description: "e.g. var_90h" }, new_name: { type: "string" } }, required: ["address", "old_name", "new_name"] } },
+  { name: "set_var_type", description: "Change a variable's C type (afvt): int*, char[64]…", run: setVarType, inputSchema: { type: "object", properties: { address: ADDR, var_name: { type: "string" }, type: { type: "string" } }, required: ["address", "var_name", "type"] } },
+  { name: "set_comment", description: "Comment at an address — appears in disassembly (CCu).", run: setComment, inputSchema: addrSchema({ comment: { type: "string" } }, ["comment"]) },
+  { name: "get_function_signature", description: "Current signature of a function (afs).", run: getFunctionSignature, inputSchema: addrSchema() },
+  { name: "set_function_signature", description: "Set a function's signature (afs), e.g. \"int main(int argc, char **argv)\".", run: setFunctionSignature, inputSchema: addrSchema({ signature: { type: "string" } }, ["signature"]) },
+  { name: "seek_to", description: "Move the rizin cursor (s) — subsequent pd/px default to it.", run: seekTo, inputSchema: addrSchema() },
+  { name: "get_current_address", description: "Current cursor + containing function.", run: getCurrentAddress, inputSchema: { type: "object", properties: {} } },
+  { name: "run_command", description: "Raw rizin command (escape hatch). Shell (!) and write (w*) commands blocked unless RIZIN_MCP_ALLOW_DANGEROUS=1.", run: runCommand, inputSchema: { type: "object", properties: { command: { type: "string", description: "e.g. 'afl~main', 'pdf @ sym.main', 'izz~password'" }, ...LIST_PROPS }, required: ["command"] } },
 ];
 
-const HANDLERS = {
-  open_file: openFile,
-  close_file: closeFile,
-  analyze,
-  show_info: showInfo,
-  analysis_info: analysisInfo,
-  list_functions: listFunctions,
-  list_imports: listImports,
-  list_exports: listExports,
-  list_symbols: listSymbols,
-  list_sections: listSections,
-  list_libraries: listLibraries,
-  list_entrypoints: listEntrypoints,
-  list_strings: listStrings,
-  list_flags: listFlags,
-  list_relocations: listRelocations,
-  list_comments: listComments,
-  list_classes: listClasses,
-  list_methods: listMethods,
-  show_function_details: showFunctionDetails,
-  list_function_vars: listFunctionVars,
-  list_function_calls: listFunctionCalls,
-  function_graph: functionGraph,
-  call_graph: callGraph,
-  basic_blocks: basicBlocks,
-  disassemble_function: disassembleFunction,
-  disassemble_at: disassembleAt,
-  hexdump,
-  read_hex: readHex,
-  read_memory: readMemory,
-  print_string_at: printStringAt,
-  xrefs_to: xrefsTo,
-  xrefs_from: xrefsFrom,
-  search: searchPatterns,
-  lookup_address: lookupAddress,
-  lookup_symbol: lookupSymbol,
-  lookup_export: lookupExport,
-  decompile_function: decompileFunction,
-  rename_function: renameFunction,
-  rename_flag: renameFlag,
-  rename_function_var: renameFunctionVar,
-  set_var_type: setVarType,
-  set_comment: setComment,
-  get_function_signature: getFunctionSignature,
-  set_function_signature: setFunctionSignature,
-  seek_to: seekTo,
-  get_current_address: getCurrentAddress,
-  run_command: runCommand,
-};
+
 
 // ---------------------------------------------------------------- MCP stdio
 
-const rl = (await import("node:readline")).createInterface({ input: process.stdin, terminal: false });
+const rl = (await import("node:readline")).createInterface({ input: process.stdin });
 const write = (msg) => process.stdout.write(JSON.stringify(msg) + "\n");
 
 rl.on("line", (line) => {
@@ -658,12 +595,12 @@ rl.on("line", (line) => {
       reply({});
       return;
     case "tools/list":
-      reply({ tools: TOOLS });
+      reply({ tools: TOOLS.map(({ run, ...t }) => t) }); // run is server-internal
       return;
     case "tools/call": {
-      const handler = HANDLERS[params?.name];
-      if (!handler) return replyErr(-32602, `unknown tool: ${params?.name}`);
-      handler(params?.arguments || {})
+      const tool = TOOLS.find((t) => t.name === params?.name);
+      if (!tool) return replyErr(-32602, `unknown tool: ${params?.name}`);
+      tool.run(params?.arguments || {})
         .then((result) => write({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(result) }] } }))
         .catch((e) => write({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ error: String(e?.message ?? e) }) }], isError: true } }));
       return;
