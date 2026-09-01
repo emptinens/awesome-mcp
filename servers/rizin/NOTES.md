@@ -1,6 +1,6 @@
 # rizin MCP server
 
-MCP server exposing the [rizin](https://rizin.re) reverse-engineering framework to coding agents. 44 tools: open/analyze binaries, list functions/imports/exports/symbols/sections/strings, disassemble, hexdump, xrefs, search, rename, comment, set signatures, raw command escape hatch.
+MCP server exposing the [rizin](https://rizin.re) reverse-engineering framework to coding agents. 47 tools: open/analyze binaries, list functions/imports/exports/symbols/sections/strings, disassemble, hexdump, xrefs, search, rename, comment, set signatures, raw command escape hatch.
 
 Zero runtime dependencies (Node built-ins), stdio transport, MCP `2024-11-05`.
 
@@ -23,7 +23,7 @@ One long-lived `rizin -q -0` child per open file, speaking the **r2pipe protocol
 
 ### Why this design (vs. radareorg/radare2-mcp)
 
-The reference r2mcp is ~8k lines of C with a build step. This is one 35KB Node file, no build, same MCP protocol, and fixes protocol quirks the reference glosses over:
+The reference r2mcp is ~8k lines of C with a build step. This is one 38KB Node file, no build, same MCP protocol, and fixes protocol quirks the reference glosses over:
 
 **r2pipe has three traps. All three are handled:**
 
@@ -38,7 +38,8 @@ The reference r2mcp is ~8k lines of C with a build step. This is one 35KB Node f
 - **File as argv, not `o` command.** `rizin -q -0 <file>` parses the binary at startup (emitting the leading NUL when ready). The `o` command inside `-0` mode misbehaves; reopening a file respawns the child with new argv. Kill of the old child is instance-guarded so its `exit` event can't clobber the new child's state.
 - **JSON-first output.** Every `j`-suffixed rizin command (`aflj`, `iij`, `axtj`, `/zj`...) is parsed into structured objects; non-JSON output falls back to raw text. Agents get typed data when it exists.
 - **Pagination everywhere.** Every list tool takes `cursor`/`limit` (default 200, max 2000) and returns `{items, nextCursor, total}`. A 63MB GameAssembly has ~9k functions; unpaginated dumps would blow the agent's context.
-- **Address sanitizer.** `0x`-hex or decimal only; rejects injection-shaped strings before they reach rizin.
+- **Name resolution.** Every address-taking tool also accepts function/flag names (`main`, `sym.imp.fwrite`, `fcn.000030c0`) — rizin's seek resolves both. Injection-shaped strings (`;`, newlines) are rejected before they reach rizin; numeric-only fields (base_address, search values) stay strict.
+- **Xref enrichment.** `xrefs_to` looks up the containing function of every xref source (`fdj`) — the question every agent asks next.
 - **Dangerous command block.** `run_command` rejects shell escapes (`!`, `!!`) and file writes (`w*`) unless `RIZIN_MCP_ALLOW_DANGEROUS=1`.
 - **Analysis-level cache.** `analyzed` tracks the level; `analyze` skips re-running (re-analysis of a 63MB binary takes minutes).
 - **Output truncation** at 60KB (env-tunable via `RIZIN_MCP_MAX_OUTPUT`).
@@ -52,7 +53,7 @@ The reference r2mcp is ~8k lines of C with a build step. This is one 35KB Node f
 - `/j` doesn't exist. String search is `/zj`, hex `/xj`, value `/v{1,2,4,8}j`, asm `/aj`, wide via `/zj <pat> l encoding=utf16le`.
 - No `pdc`/`pdd`/`pdg` in core (those are r2 plugins). Pseudo-code via `pdsf` (function summary: strings, calls, refs), `pds`, `pdr`. Install rz-ghidra for full C.
 
-## Tool inventory (44)
+## Tool inventory (47)
 
 | Tool | rizin | Notes |
 |---|---|---|
@@ -80,6 +81,9 @@ The reference r2mcp is ~8k lines of C with a build step. This is one 35KB Node f
 | `print_string_at` | `ps` | NUL-terminated string at addr |
 | `read_hex` | `p8` | compact hex pairs |
 | `analysis_info` | `aaij` | fcns, xrefs, calls, coverage % |
+| `function_graph` | `agf json` | CFG: blocks with bodies + jump edges |
+| `call_graph` | `agC json` | global callgraph, paginated |
+| `basic_blocks` | `afbj` | BB list: addr, size, in/out |
 | `show_function_details` | `afij` | size, bbcount, stack, vars, signature |
 | `disassemble_function` | `pdf` | paginated |
 | `disassemble_at` | `pd N` | |

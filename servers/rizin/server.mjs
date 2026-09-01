@@ -116,6 +116,15 @@ function checkAddr(addr, what = "address") {
   return s;
 }
 
+/** Accept hex/decimal addresses OR flag/function names ("main", "sym.imp.fwrite").
+ *  rizin's seek resolves both; we only reject obviously-hostile strings. */
+function addrOrName(v, what = "address") {
+  const s = String(v).trim();
+  if (!s) throw new Error(`${what} required`);
+  if (/[\n\r\x00;]/.test(s)) throw new Error(`${what} contains forbidden characters`);
+  return s.replace(/\s+/g, "");
+}
+
 function clamp(n, def, max) {
   const v = n === undefined || n === null || isNaN(Number(n)) ? def : Number(n);
   return Math.max(1, Math.min(v, max));
@@ -246,14 +255,14 @@ async function showInfo() {
 
 async function showFunctionDetails({ address }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   await r2cmd(`s ${a}`);
   return r2json("afij");
 }
 
 async function disassembleFunction({ address, cursor, limit }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   // pd @ function: use pdf (disassemble function) via af+ pdf
   const text = await r2cmd(`s ${a}; pdf`, { timeout: 60000 });
   const lines = text.split("\n");
@@ -262,7 +271,7 @@ async function disassembleFunction({ address, cursor, limit }) {
 
 async function disassembleAt({ address, count = 20 }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   const n = clamp(count, 20, 500);
   const text = await r2cmd(`s ${a}; pd ${n}`);
   return truncateText(text);
@@ -270,7 +279,7 @@ async function disassembleAt({ address, count = 20 }) {
 
 async function hexdump({ address, count = 64 }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   const n = clamp(count, 64, 4096);
   const text = await r2cmd(`s ${a}; px ${n}`);
   return truncateText(text);
@@ -278,7 +287,7 @@ async function hexdump({ address, count = 64 }) {
 
 async function readMemory({ address, count = 64 }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   const n = clamp(count, 64, 8192);
   const data = await r2json(`s ${a}; pxj ${n}`);
   return Array.isArray(data) ? { address: a, bytes: data, hex: data.map((b) => b.toString(16).padStart(2, "0")).join("") } : data;
@@ -286,13 +295,23 @@ async function readMemory({ address, count = 64 }) {
 
 async function xrefsTo({ address }) {
   requireFile();
-  const a = checkAddr(address, "address");
-  return r2json(`s ${a}; axtj`);
+  const a = addrOrName(address, "address");
+  const data = await r2json(`s ${a}; axtj`);
+  if (!Array.isArray(data) || data.length === 0) return data;
+  // enrich: which function does each "from" belong to? (agents always ask this next)
+  const enriched = [];
+  for (const x of data.slice(0, 200)) {
+    // fdj takes no argument — seek to the xref source, then describe it
+    const fd = await r2json(`s ${x.from}; fdj`);
+    enriched.push({ ...x, from_function: Array.isArray(fd) ? fd[0]?.name : fd?.name });
+  }
+  if (data.length > 200) enriched.push({ note: `${data.length - 200} more xrefs not enriched` });
+  return enriched;
 }
 
 async function xrefsFrom({ address }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   // axfj lists refs from a single offset (often empty at function heads).
   // For a whole-function view use the function's callrefs/datarefs from afij.
   const direct = await r2json(`s ${a}; axfj`);
@@ -358,7 +377,7 @@ async function searchPatterns({ query, type = "string", encoding, cursor, limit 
 
 async function lookupAddress({ address }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   return r2json(`s ${a}; fdj`);
 }
 
@@ -392,7 +411,7 @@ async function listMethods({ class_name }) {
 
 async function decompileFunction({ address, mode = "pdsf" }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   // rizin 0.8.2 core has no pdc/pdd/pdg — those are plugins (rz-ghidra etc).
   // pdsf gives a structured pseudo-summary: strings, calls, refs, jumps.
   let cmd;
@@ -408,13 +427,13 @@ async function decompileFunction({ address, mode = "pdsf" }) {
 
 async function listFunctionVars({ address }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   return r2json(`s ${a}; afvlj`);
 }
 
 async function renameFunctionVar({ address, old_name, new_name }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   if (!old_name || !new_name) throw new Error("old_name and new_name required");
   const o = String(old_name).replace(/[^a-zA-Z0-9_.$-]/g, "");
   const n = String(new_name).replace(/[^a-zA-Z0-9_.$-]/g, "");
@@ -425,7 +444,7 @@ async function renameFunctionVar({ address, old_name, new_name }) {
 
 async function setVarType({ address, var_name, type }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   if (!var_name || !type) throw new Error("var_name and type required");
   const v = String(var_name).replace(/[^a-zA-Z0-9_.$-]/g, "");
   const t = String(type).replace(/[;\n]/g, " ");
@@ -458,14 +477,14 @@ async function listComments({ regex, cursor, limit }) {
 
 async function printStringAt({ address }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   const text = await r2cmd(`ps @ ${a}`);
   return { address: a, string: text.trim() };
 }
 
 async function readHex({ address, count = 32 }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   const n = clamp(count, 32, 4096);
   const text = await r2cmd(`p8 ${n} @ ${a}`);
   return { address: a, count: n, hex: text.trim() };
@@ -476,9 +495,40 @@ async function analysisInfo() {
   return r2json("aaij");
 }
 
+async function functionGraph({ address }) {
+  requireFile();
+  const a = addrOrName(address, "address");
+  // CFG: nodes = basic blocks with bodies, edges = jumps
+  const data = await r2json(`s ${a}; agf json`);
+  if (typeof data === "string") return { error: "no function graph — run analyze first", raw: truncateText(data, 2000) };
+  const nodes = data.nodes || [];
+  const edges = [];
+  for (const n of nodes) {
+    for (const out of n.out_nodes || []) edges.push({ from: n.id, to: out });
+  }
+  return { address: a, blocks: nodes.length, edges: edges.length, nodes, note: "nodes[].body = disasm of block; out_nodes = jump targets" };
+}
+
+async function callGraph({ cursor, limit }) {
+  requireFile();
+  // global callgraph — can be huge, paginate node-wise
+  const data = await r2json("agC json", { timeout: 120000 });
+  if (typeof data === "string") return { error: "no callgraph — run analyze first", raw: truncateText(data, 2000) };
+  const nodes = (data.nodes || []).map((n) => ({ id: n.id, name: n.title, offset: n.offset, calls: (n.out_nodes || []).length }));
+  return pageSlice(nodes, { cursor, limit });
+}
+
+async function basicBlocks({ address }) {
+  requireFile();
+  const a = addrOrName(address, "address");
+  const data = await r2json(`s ${a}; afbj`);
+  if (!Array.isArray(data)) return data;
+  return { address: a, blocks: data.length, items: data.slice(0, 500) };
+}
+
 async function renameFunction({ address, new_name }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   const n = String(new_name).replace(/[^a-zA-Z0-9_.]/g, "_");
   await r2cmd(`s ${a}; afn ${n}`);
   return { renamed: n, address: a };
@@ -486,7 +536,7 @@ async function renameFunction({ address, new_name }) {
 
 async function renameFlag({ address, new_name }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   // resolve the flag name at the address, then rename it (fr takes names, not addresses)
   const fd = await r2json(`s ${a}; fdj`);
   const oldName = Array.isArray(fd) ? fd[0]?.name : fd?.name;
@@ -498,7 +548,7 @@ async function renameFlag({ address, new_name }) {
 
 async function setComment({ address, comment }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   // CC <text> @ addr form is rejected by rizin; seek first
   const text = String(comment).replace(/;/g, "\;").replace(/@/g, " ");
   await r2cmd(`s ${a}; CCu ${text}`);
@@ -508,7 +558,7 @@ async function setComment({ address, comment }) {
 
 async function setFunctionSignature({ address, signature }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   const sig = String(signature).replace(/"/g, '\\"');
   await r2cmd(`s ${a}; afs "${sig}"`);
   return { signature, address: a };
@@ -516,13 +566,13 @@ async function setFunctionSignature({ address, signature }) {
 
 async function getFunctionSignature({ address }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   return r2cmd(`s ${a}; afs`).then((t) => t.trim());
 }
 
 async function listFunctionCalls({ address }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   const data = await r2json(`s ${a}; afij`);
   if (!Array.isArray(data) || !data[0]) return data;
   const f = data[0];
@@ -534,16 +584,9 @@ async function listGlobals() {
   return r2json("f~sym.!");
 }
 
-async function getSectionsMap() {
-  requireFile();
-  const data = await r2json("iSj");
-  if (!Array.isArray(data)) return data;
-  return data.map((s) => ({ name: s.name, vaddr: s.vaddr, vsize: s.vsize, perm: s.perm, type: s.type }));
-}
-
 async function seekTo({ address }) {
   requireFile();
-  const a = checkAddr(address, "address");
+  const a = addrOrName(address, "address");
   await r2cmd(`s ${a}`);
   const here = await r2json("sj");
   return here;
@@ -589,11 +632,6 @@ async function listFlags({ regex, cursor, limit }) {
   return pageSlice(items, { cursor, limit });
 }
 
-async function listHashes() {
-  requireFile();
-  return r2json("omj");
-}
-
 // ---------------------------------------------------------------- MCP schema
 
 const LIST_PROPS = {
@@ -602,7 +640,7 @@ const LIST_PROPS = {
   limit: { type: "integer", description: `Max results per page (default ${PAGE_DEFAULT}, max ${PAGE_MAX})` },
 };
 const listSchema = (extra = {}) => ({ type: "object", properties: { ...LIST_PROPS, ...extra } });
-const addrSchema = (desc = "Target address (hex 0x... or decimal)") => ({ type: "object", properties: { address: { type: "string", description: desc }, cursor: { type: "integer" }, limit: { type: "integer" } }, required: ["address"] });
+const addrSchema = (desc = "Target address (0x..., decimal) or function/flag name (e.g. main)") => ({ type: "object", properties: { address: { type: "string", description: desc }, cursor: { type: "integer" }, limit: { type: "integer" } }, required: ["address"] });
 
 const TOOLS = [
   { name: "open_file", description: "Open a binary in rizin for analysis. Call this first. Optionally set base_address/arch/bits/cpu for raw (headerless) binaries. Runs analysis by default (set run_analyze=false to skip).", inputSchema: { type: "object", properties: { file_path: { type: "string", description: "Absolute path to binary" }, base_address: { type: "string", description: "Base address for PIE/raw binaries (e.g. 0x400000)" }, arch: { type: "string", description: "Architecture override (arm, x86, mips...)" }, bits: { type: "integer", description: "Bits override (16/32/64)" }, cpu: { type: "string", description: "CPU variant (cortex, generic...)" }, run_analyze: { type: "boolean", default: true }, analysis_level: { type: "integer", minimum: 0, maximum: 4, default: 2 } }, required: ["file_path"] } },
@@ -621,6 +659,9 @@ const TOOLS = [
   { name: "list_classes", description: "Class names for OO languages (ic): C++, ObjC, Swift, Java/Dalvik.", inputSchema: { type: "object", properties: {} } },
   { name: "list_methods", description: "Methods of a specific class.", inputSchema: { type: "object", properties: { class_name: { type: "string" } }, required: ["class_name"] } },
   { name: "list_function_calls", description: "Calls made by the function at address (afc) — callee list.", inputSchema: addrSchema("Function address") },
+  { name: "function_graph", description: "Control-flow graph of a function (agf): basic blocks with disasm bodies and jump edges. The real decompiler substitute for understanding branching.", inputSchema: { type: "object", properties: { address: { type: "string", description: "Function address or name" } }, required: ["address"] } },
+  { name: "call_graph", description: "Global callgraph (agC): every function, its offset, call count. Paginated.", inputSchema: listSchema() },
+  { name: "basic_blocks", description: "Basic blocks of a function (afb): addresses, sizes, instruction counts, in/out edges.", inputSchema: { type: "object", properties: { address: { type: "string", description: "Function address or name" } }, required: ["address"] } },
   { name: "list_function_vars", description: "Arguments and local variables of the function at address (afvl): names, types, stack offsets.", inputSchema: addrSchema("Function address") },
   { name: "rename_function_var", description: "Rename an argument/local variable in the function (afvn).", inputSchema: { type: "object", properties: { address: { type: "string", description: "Function address" }, old_name: { type: "string", description: "Current var name, e.g. var_90h" }, new_name: { type: "string" } }, required: ["address", "old_name", "new_name"] } },
   { name: "set_var_type", description: "Change the type of an argument/local variable (afvt), e.g. 'int*', 'char[64]'.", inputSchema: { type: "object", properties: { address: { type: "string", description: "Function address" }, var_name: { type: "string" }, type: { type: "string", description: "C type, e.g. int* or char[8]" } }, required: ["address", "var_name", "type"] } },
@@ -630,11 +671,11 @@ const TOOLS = [
   { name: "read_hex", description: "Compact hex bytes at address (p8) — no ASCII column, just pairs.", inputSchema: { type: "object", properties: { address: { type: "string" }, count: { type: "integer", default: 32, maximum: 4096 } }, required: ["address"] } },
   { name: "analysis_info", description: "Analysis summary (aai): function count, code coverage, xref counts.", inputSchema: { type: "object", properties: {} } },
   { name: "show_function_details", description: "Detailed info for the function at address (afi): size, basic blocks, stack frame, vars.", inputSchema: addrSchema() },
-  { name: "disassemble_function", description: "Full assembly listing of the function at address (pdf). Paginated.", inputSchema: addrSchema() },
-  { name: "disassemble_at", description: "Disassemble N instructions starting at address (pd N).", inputSchema: { type: "object", properties: { address: { type: "string" }, count: { type: "integer", default: 20, maximum: 500 } }, required: ["address"] } },
+  { name: "disassemble_function", description: "Full assembly listing of a function (pdf). Accepts address OR name (e.g. \"main\", \"sym.imp.fwrite\"). Paginated.", inputSchema: addrSchema() },
+  { name: "disassemble_at", description: "Disassemble N instructions starting at address (pd N).", inputSchema: { type: "object", properties: { address: { type: "string", description: "Address or name" }, count: { type: "integer", default: 20, maximum: 500 } }, required: ["address"] } },
   { name: "hexdump", description: "Hexdump at address (px). Readable form with ASCII column.", inputSchema: { type: "object", properties: { address: { type: "string" }, count: { type: "integer", default: 64, maximum: 4096 } }, required: ["address"] } },
   { name: "read_memory", description: "Read raw bytes at address as JSON array (pxj).", inputSchema: { type: "object", properties: { address: { type: "string" }, count: { type: "integer", default: 64, maximum: 8192 } }, required: ["address"] } },
-  { name: "xrefs_to", description: "Find all code references TO the address (axt) — who calls/reads it.", inputSchema: addrSchema() },
+  { name: "xrefs_to", description: "Find all code references TO an address or symbol (axt) — who calls/reads it. Each xref is enriched with the containing function name.", inputSchema: addrSchema() },
   { name: "xrefs_from", description: "References FROM an address: direct refs (axf) plus the function call and data refs (afij).", inputSchema: addrSchema() },
   { name: "search", description: "Search memory/file for patterns: string, hex, wide, or numeric value. JSON results.", inputSchema: { type: "object", properties: { query: { type: "string", description: "What to search for" }, type: { type: "string", enum: ["string", "hex", "wide", "value"], default: "string" }, ...LIST_PROPS }, required: ["query"] } },
   { name: "lookup_address", description: "What is at this address: flag, symbol, section (fd).", inputSchema: addrSchema() },
@@ -668,6 +709,9 @@ const HANDLERS = {
   list_classes: listClasses,
   list_methods: listMethods,
   list_function_calls: listFunctionCalls,
+  function_graph: functionGraph,
+  call_graph: callGraph,
+  basic_blocks: basicBlocks,
   list_function_vars: listFunctionVars,
   rename_function_var: renameFunctionVar,
   set_var_type: setVarType,
@@ -708,7 +752,7 @@ readline.on("line", async (line) => {
   try { req = JSON.parse(line); } catch { return; }
   const { id, method, params } = req;
   if (method === "initialize") {
-    write({ jsonrpc: "2.0", id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "rizin-mcp", version: "1.1.0" } } });
+    write({ jsonrpc: "2.0", id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "rizin-mcp", version: "1.2.0" } } });
     return;
   }
   if (method === "notifications/initialized" || method === "initialized") return;

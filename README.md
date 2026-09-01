@@ -56,7 +56,7 @@ Full discovery notes (how each site's data access was reverse-engineered) in [se
 
 ### [rizin](servers/rizin/) — reverse-engineering for coding agents
 
-44 tools wrapping the [rizin](https://rizin.re) RE framework: open/analyze binaries, list functions/imports/symbols/strings/vars/relocs/comments, disassemble, hexdump, xrefs, search, decompile summaries, rename/comment/retype vars, set signatures, raw-command escape hatch.
+47 tools wrapping the [rizin](https://rizin.re) RE framework: open/analyze binaries, list functions/imports/symbols/strings/vars/relocs/comments, disassemble, hexdump, xrefs (enriched with containing function), search, control-flow and call graphs, decompile summaries, rename/comment/retype vars, set signatures, raw-command escape hatch. Address params accept names (`main`, `sym.imp.fwrite`) as well as hex.
 
 One long-lived `rizin -q -0` child speaking r2pipe (NUL-terminated responses). Handles the three r2pipe traps: leading-NUL alignment, command serialization, latin1→utf8 chunk-split decoding. JSON-first output, pagination on every list tool, dangerous commands blocked by default.
 
