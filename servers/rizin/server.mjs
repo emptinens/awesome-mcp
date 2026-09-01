@@ -362,10 +362,14 @@ async function lookupAddress({ address }) {
   return r2json(`s ${a}; fdj`);
 }
 
-async function lookupSymbol({ name }) {
+async function lookupSymbol({ name, cursor, limit }) {
   requireFile();
   const n = String(name);
-  return r2json(`isj~${n}`);
+  const data = await r2json("isj");
+  let items = Array.isArray(data) ? data : [];
+  const re = new RegExp(n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+  items = items.filter((sym) => re.test(sym.name || "") || re.test(sym.realname || "") || re.test(sym.flagname || ""));
+  return pageSlice(items, { cursor, limit });
 }
 
 async function lookupExport({ name }) {
@@ -383,7 +387,7 @@ async function listClasses() {
 async function listMethods({ class_name }) {
   requireFile();
   if (!class_name) throw new Error("class_name required");
-  return r2json(`ic ${JSON.stringify(String(class_name))}`);
+  return r2json(`icmj ${JSON.stringify(String(class_name))}`);
 }
 
 async function decompileFunction({ address, mode = "pdsf" }) {
@@ -392,7 +396,7 @@ async function decompileFunction({ address, mode = "pdsf" }) {
   // rizin 0.8.2 core has no pdc/pdd/pdg — those are plugins (rz-ghidra etc).
   // pdsf gives a structured pseudo-summary: strings, calls, refs, jumps.
   let cmd;
-  if (mode === "pds") cmd = `s ${a}; pds`;
+  if (mode === "pds") cmd = `s ${a}; pds 5000`;
   else if (mode === "pdr") cmd = `s ${a}; pdr`;  // recursive disassembly
   else cmd = `s ${a}; pdsf`;
   const text = await r2cmd(cmd, { timeout: 60000 });
@@ -400,6 +404,76 @@ async function decompileFunction({ address, mode = "pdsf" }) {
     return { error: "empty decompiler output — is the address inside a function? run analyze and show_function_details first", address: a };
   }
   return truncateText(text);
+}
+
+async function listFunctionVars({ address }) {
+  requireFile();
+  const a = checkAddr(address, "address");
+  return r2json(`s ${a}; afvlj`);
+}
+
+async function renameFunctionVar({ address, old_name, new_name }) {
+  requireFile();
+  const a = checkAddr(address, "address");
+  if (!old_name || !new_name) throw new Error("old_name and new_name required");
+  const o = String(old_name).replace(/[^a-zA-Z0-9_.$-]/g, "");
+  const n = String(new_name).replace(/[^a-zA-Z0-9_.$-]/g, "");
+  const out = await r2cmd(`s ${a}; afvn ${n} ${o}`);
+  if (/cannot find|error/i.test(out)) return { error: out.trim() || `variable ${o} not found in function at ${a}`, address: a };
+  return { renamed: n, was: o, address: a };
+}
+
+async function setVarType({ address, var_name, type }) {
+  requireFile();
+  const a = checkAddr(address, "address");
+  if (!var_name || !type) throw new Error("var_name and type required");
+  const v = String(var_name).replace(/[^a-zA-Z0-9_.$-]/g, "");
+  const t = String(type).replace(/[;\n]/g, " ");
+  const out = await r2cmd(`s ${a}; afvt ${v} ${t}`);
+  if (/cannot find|error/i.test(out)) return { error: out.trim() || `variable ${v} not found in function at ${a}`, address: a };
+  return { typed: v, type: t, address: a };
+}
+
+async function listRelocations({ regex, cursor, limit }) {
+  requireFile();
+  const data = await r2json("irj");
+  let items = Array.isArray(data) ? data : [];
+  if (regex) {
+    const re = new RegExp(String(regex), "i");
+    items = items.filter((r) => re.test(r.name || ""));
+  }
+  return pageSlice(items, { cursor, limit });
+}
+
+async function listComments({ regex, cursor, limit }) {
+  requireFile();
+  const data = await r2json("CClj");
+  let items = Array.isArray(data) ? data : [];
+  if (regex) {
+    const re = new RegExp(String(regex), "i");
+    items = items.filter((c) => re.test(c.name || ""));
+  }
+  return pageSlice(items, { cursor, limit });
+}
+
+async function printStringAt({ address }) {
+  requireFile();
+  const a = checkAddr(address, "address");
+  const text = await r2cmd(`ps @ ${a}`);
+  return { address: a, string: text.trim() };
+}
+
+async function readHex({ address, count = 32 }) {
+  requireFile();
+  const a = checkAddr(address, "address");
+  const n = clamp(count, 32, 4096);
+  const text = await r2cmd(`p8 ${n} @ ${a}`);
+  return { address: a, count: n, hex: text.trim() };
+}
+
+async function analysisInfo() {
+  requireFile();
+  return r2json("aaij");
 }
 
 async function renameFunction({ address, new_name }) {
@@ -547,6 +621,14 @@ const TOOLS = [
   { name: "list_classes", description: "Class names for OO languages (ic): C++, ObjC, Swift, Java/Dalvik.", inputSchema: { type: "object", properties: {} } },
   { name: "list_methods", description: "Methods of a specific class.", inputSchema: { type: "object", properties: { class_name: { type: "string" } }, required: ["class_name"] } },
   { name: "list_function_calls", description: "Calls made by the function at address (afc) — callee list.", inputSchema: addrSchema("Function address") },
+  { name: "list_function_vars", description: "Arguments and local variables of the function at address (afvl): names, types, stack offsets.", inputSchema: addrSchema("Function address") },
+  { name: "rename_function_var", description: "Rename an argument/local variable in the function (afvn).", inputSchema: { type: "object", properties: { address: { type: "string", description: "Function address" }, old_name: { type: "string", description: "Current var name, e.g. var_90h" }, new_name: { type: "string" } }, required: ["address", "old_name", "new_name"] } },
+  { name: "set_var_type", description: "Change the type of an argument/local variable (afvt), e.g. 'int*', 'char[64]'.", inputSchema: { type: "object", properties: { address: { type: "string", description: "Function address" }, var_name: { type: "string" }, type: { type: "string", description: "C type, e.g. int* or char[8]" } }, required: ["address", "var_name", "type"] } },
+  { name: "list_relocations", description: "Relocation table (ir): offsets, types, targets. Filter by regex. Paginated.", inputSchema: listSchema() },
+  { name: "list_comments", description: "All comments in the binary (CCl). Filter by regex. Paginated.", inputSchema: listSchema() },
+  { name: "print_string_at", description: "Read the NUL-terminated string at an address (ps).", inputSchema: { type: "object", properties: { address: { type: "string" } }, required: ["address"] } },
+  { name: "read_hex", description: "Compact hex bytes at address (p8) — no ASCII column, just pairs.", inputSchema: { type: "object", properties: { address: { type: "string" }, count: { type: "integer", default: 32, maximum: 4096 } }, required: ["address"] } },
+  { name: "analysis_info", description: "Analysis summary (aai): function count, code coverage, xref counts.", inputSchema: { type: "object", properties: {} } },
   { name: "show_function_details", description: "Detailed info for the function at address (afi): size, basic blocks, stack frame, vars.", inputSchema: addrSchema() },
   { name: "disassemble_function", description: "Full assembly listing of the function at address (pdf). Paginated.", inputSchema: addrSchema() },
   { name: "disassemble_at", description: "Disassemble N instructions starting at address (pd N).", inputSchema: { type: "object", properties: { address: { type: "string" }, count: { type: "integer", default: 20, maximum: 500 } }, required: ["address"] } },
@@ -586,6 +668,14 @@ const HANDLERS = {
   list_classes: listClasses,
   list_methods: listMethods,
   list_function_calls: listFunctionCalls,
+  list_function_vars: listFunctionVars,
+  rename_function_var: renameFunctionVar,
+  set_var_type: setVarType,
+  list_relocations: listRelocations,
+  list_comments: listComments,
+  print_string_at: printStringAt,
+  read_hex: readHex,
+  analysis_info: analysisInfo,
   show_function_details: showFunctionDetails,
   disassemble_function: disassembleFunction,
   disassemble_at: disassembleAt,
@@ -618,7 +708,7 @@ readline.on("line", async (line) => {
   try { req = JSON.parse(line); } catch { return; }
   const { id, method, params } = req;
   if (method === "initialize") {
-    write({ jsonrpc: "2.0", id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "rizin-mcp", version: "1.0.0" } } });
+    write({ jsonrpc: "2.0", id, result: { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "rizin-mcp", version: "1.1.0" } } });
     return;
   }
   if (method === "notifications/initialized" || method === "initialized") return;

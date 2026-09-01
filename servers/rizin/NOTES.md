@@ -1,6 +1,6 @@
 # rizin MCP server
 
-MCP server exposing the [rizin](https://rizin.re) reverse-engineering framework to coding agents. 36 tools: open/analyze binaries, list functions/imports/exports/symbols/sections/strings, disassemble, hexdump, xrefs, search, rename, comment, set signatures, raw command escape hatch.
+MCP server exposing the [rizin](https://rizin.re) reverse-engineering framework to coding agents. 44 tools: open/analyze binaries, list functions/imports/exports/symbols/sections/strings, disassemble, hexdump, xrefs, search, rename, comment, set signatures, raw command escape hatch.
 
 Zero runtime dependencies (Node built-ins), stdio transport, MCP `2024-11-05`.
 
@@ -23,7 +23,7 @@ One long-lived `rizin -q -0` child per open file, speaking the **r2pipe protocol
 
 ### Why this design (vs. radareorg/radare2-mcp)
 
-The reference r2mcp is ~8k lines of C with a build step. This is one 30KB Node file, no build, same MCP protocol, and fixes protocol quirks the reference glosses over:
+The reference r2mcp is ~8k lines of C with a build step. This is one 35KB Node file, no build, same MCP protocol, and fixes protocol quirks the reference glosses over:
 
 **r2pipe has three traps. All three are handled:**
 
@@ -52,7 +52,7 @@ The reference r2mcp is ~8k lines of C with a build step. This is one 30KB Node f
 - `/j` doesn't exist. String search is `/zj`, hex `/xj`, value `/v{1,2,4,8}j`, asm `/aj`, wide via `/zj <pat> l encoding=utf16le`.
 - No `pdc`/`pdd`/`pdg` in core (those are r2 plugins). Pseudo-code via `pdsf` (function summary: strings, calls, refs), `pds`, `pdr`. Install rz-ghidra for full C.
 
-## Tool inventory (36)
+## Tool inventory (44)
 
 | Tool | rizin | Notes |
 |---|---|---|
@@ -72,6 +72,14 @@ The reference r2mcp is ~8k lines of C with a build step. This is one 30KB Node f
 | `list_classes` | `icj` | C++/ObjC/Java |
 | `list_methods` | `ic` | |
 | `list_function_calls` | `afij` | callrefs + datarefs |
+| `list_function_vars` | `afvlj` | args/locals: names, types, stack offsets |
+| `rename_function_var` | `afvn` | rename arg/local |
+| `set_var_type` | `afvt` | change var C type |
+| `list_relocations` | `irj` | paginated (59MB JSON on big PEs) |
+| `list_comments` | `CClj` | all comments |
+| `print_string_at` | `ps` | NUL-terminated string at addr |
+| `read_hex` | `p8` | compact hex pairs |
+| `analysis_info` | `aaij` | fcns, xrefs, calls, coverage % |
 | `show_function_details` | `afij` | size, bbcount, stack, vars, signature |
 | `disassemble_function` | `pdf` | paginated |
 | `disassemble_at` | `pd N` | |
@@ -95,4 +103,4 @@ The reference r2mcp is ~8k lines of C with a build step. This is one 30KB Node f
 
 ## Verification
 
-Tested end-to-end against `/bin/ls` (38/38 tool checks) and a 63MB PE32+ GameAssembly.dll: open → analyze → list → search → xrefs → rename → comment → close → reopen, including rapid-fire command interleaving (no response cross-contamination).
+Tested end-to-end against `/bin/ls` (38+9/47 tool checks) and a 63MB PE32+ GameAssembly.dll: open → analyze → list → search → xrefs → rename → comment → close → reopen, including rapid-fire command interleaving (no response cross-contamination).
