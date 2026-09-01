@@ -56,9 +56,9 @@ Full discovery notes (how each site's data access was reverse-engineered) in [se
 
 ### [rizin](servers/rizin/) — reverse-engineering for coding agents
 
-47 tools wrapping the [rizin](https://rizin.re) RE framework: open/analyze binaries, list functions/imports/symbols/strings/vars/relocs/comments, disassemble, hexdump, xrefs (enriched with containing function), search, control-flow and call graphs, decompile summaries, rename/comment/retype vars, set signatures, raw-command escape hatch. Address params accept names (`main`, `sym.imp.fwrite`) as well as hex.
+47 tools wrapping the [rizin](https://rizin.re) RE framework — the full RE workflow: open → analyze → explore (functions/imports/exports/symbols/sections/strings/flags/relocs/comments/classes) → drill down (disasm, hexdump, xrefs, vars, control-flow/call graphs, pseudo-code) → annotate (rename, retype, comment, signature). Address params accept names (`main`, `sym.imp.fwrite`) as well as hex; xrefs are enriched with the containing function.
 
-One long-lived `rizin -q -0` child speaking r2pipe (NUL-terminated responses). Handles the three r2pipe traps: leading-NUL alignment, command serialization, latin1→utf8 chunk-split decoding. JSON-first output, pagination on every list tool, dangerous commands blocked by default.
+One long-lived `rizin -q -0` child speaking r2pipe (NUL-terminated responses). Handles the three r2pipe traps — leading-NUL alignment, command serialization, latin1→utf8 chunk-split decoding — that silently corrupt naive implementations. JSON-first output, compact serialization, pagination on every list tool, injection guards, dangerous commands blocked by default. One ~670-line file, zero deps.
 
 **Install:**
 
